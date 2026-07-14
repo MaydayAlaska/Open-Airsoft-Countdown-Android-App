@@ -1,7 +1,43 @@
-@"
+# Android Studio
 .idea/
-.gradle/
-local.properties
-**/build/
 *.iml
-"@ | Set-Content .gitignore
+
+# Gradle cache e file generati
+.gradle/
+.kotlin/
+**/build/
+build/
+
+# Configurazione locale Android SDK
+local.properties
+
+# File di compilazione
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Native build
+.externalNativeBuild/
+.cxx/
+
+# Log e file temporanei
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+
+# File di sistema
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Profiler e schermate Android Studio
+captures/
+
+# Chiavi di firma: non caricarle mai
+*.jks
+*.keystore
+keystore.properties
