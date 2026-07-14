@@ -1,6 +1,10 @@
 <div align="center">
 
-<img src="app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" alt="Open Airsoft Countdown" width="140">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="app/src/main/res/drawable-nodpi/info_logo_dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="app/src/main/res/drawable-nodpi/info_logo_light.png">
+  <img src="app/src/main/res/drawable-nodpi/info_logo_light.png" alt="Open Airsoft Countdown" width="180">
+</picture>
 
 # Open Airsoft Countdown — Android App
 
