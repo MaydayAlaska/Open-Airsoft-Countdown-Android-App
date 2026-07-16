@@ -27,8 +27,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.text.Editable
 import android.text.InputFilter
 import android.text.InputType
+import android.text.TextWatcher
 import android.text.method.HideReturnsTransformationMethod
 import android.text.method.PasswordTransformationMethod
 import android.graphics.Color
@@ -1023,12 +1025,14 @@ class MainActivity : Activity()
 		addCardTitle(addCard, tr("Nuovo utente", "New user"))
 		val userNameInput = addStyledEditText(addCard, tr("Nome utente", "User name"), InputType.TYPE_CLASS_TEXT)
 		val userUidInput = addStyledEditText(addCard, "UID NFC", InputType.TYPE_CLASS_TEXT)
+		configureHexUidInput(userUidInput)
 		val userPinInput = addStyledEditText(addCard, tr("PIN utente (6 cifre)", "User PIN (6 digits)"), InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
 		configureSixDigitPinInput(userPinInput)
 
 		addCard.addView(createActionButton(tr("Aggiungi utente", "Add user"), ButtonStyle.Primary, true) {
 			val name = userNameInput.text.toString().trim()
-			val uid = userUidInput.text.toString().trim().uppercase()
+			val rawUid = userUidInput.text.toString().trim().uppercase()
+			val uid = normalizeUserUid(rawUid)
 			val pin = userPinInput.text.toString().trim()
 
 			if (!isValidUserName(name))
@@ -1037,7 +1041,7 @@ class MainActivity : Activity()
 				return@createActionButton
 			}
 
-			if (!isValidUserUid(uid))
+			if (!isValidUserUid(rawUid))
 			{
 				showStatus(tr("UID NFC non valido.", "Invalid NFC UID."))
 				return@createActionButton
@@ -1935,6 +1939,12 @@ class MainActivity : Activity()
 			visibilityButton.alpha = if (pinVisible) 1f else 0.65f
 		}
 
+		val errorLabel = TextView(this)
+		errorLabel.setTextColor(palette.danger)
+		errorLabel.textSize = 14f
+		errorLabel.visibility = View.GONE
+		errorLabel.text = tr("PIN non valido", "Invalid PIN")
+
 		val dialogContent = LinearLayout(this)
 		dialogContent.orientation = LinearLayout.VERTICAL
 		dialogContent.setPadding(dp(24), dp(8), dp(24), 0)
@@ -1945,14 +1955,21 @@ class MainActivity : Activity()
 				LinearLayout.LayoutParams.WRAP_CONTENT
 			)
 		)
+		dialogContent.addView(
+			errorLabel,
+			LinearLayout.LayoutParams(
+				LinearLayout.LayoutParams.MATCH_PARENT,
+				LinearLayout.LayoutParams.WRAP_CONTENT
+			).apply { topMargin = dp(8) }
+		)
+
+		input.filters = arrayOf(InputFilter.LengthFilter(6))
 
 		val dialog = AlertDialog.Builder(this)
 			.setTitle(tr("PIN amministratore", "Administrator PIN"))
 			.setMessage(tr("Inserisci il PIN per accedere al dispositivo.", "Enter the PIN to access the device."))
 			.setView(dialogContent)
-			.setPositiveButton("Login") { _, _ ->
-				sendCommand("LOGIN:${input.text}")
-			}
+			.setPositiveButton("Login", null)
 			.setNegativeButton(tr("Annulla", "Cancel"), null)
 			.create()
 
@@ -1963,6 +1980,20 @@ class MainActivity : Activity()
 			visibilityButton.alpha = 0.65f
 			input.requestFocus()
 			dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+
+			val positiveButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+			positiveButton.isEnabled = false
+
+			input.addTextChangedListener(object : TextWatcher {
+				override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+				override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+				override fun afterTextChanged(s: Editable?) {
+					val pin = s?.toString()?.trim() ?: ""
+					val valid = pin.length == 6 && pin.all { it.isDigit() }
+					positiveButton.isEnabled = valid
+					errorLabel.visibility = if (pin.isEmpty() || valid) View.GONE else View.VISIBLE
+				}
+			})
 
 			input.postDelayed({
 				val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -2294,7 +2325,8 @@ class MainActivity : Activity()
 
 		addFieldLabel(dialogContent, "UID NFC")
 		val uidInput = addStyledEditText(dialogContent, "UID NFC", InputType.TYPE_CLASS_TEXT)
-		uidInput.setText(user.uid)
+		configureHexUidInput(uidInput)
+		uidInput.setText(user.uid.chunked(2).joinToString(":"))
 
 		addFieldLabel(dialogContent, tr("PIN utente (6 cifre)", "User PIN (6 digits)"))
 		val pinInput = addStyledEditText(dialogContent, tr("PIN utente", "User PIN"), InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
@@ -2312,13 +2344,14 @@ class MainActivity : Activity()
 		dialog.setOnShowListener {
 			dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
 				val name = nameInput.text.toString().trim()
-				val uid = uidInput.text.toString().trim().uppercase()
+				val rawUid = uidInput.text.toString().trim().uppercase()
+				val uid = normalizeUserUid(rawUid)
 				val pin = pinInput.text.toString().trim()
 
 				when
 				{
 					!isValidUserName(name) -> showStatus(tr("Nome utente non valido.", "Invalid user name."))
-					!isValidUserUid(uid) -> showStatus(tr("UID NFC non valido.", "Invalid NFC UID."))
+					!isValidUserUid(rawUid) -> showStatus(tr("UID NFC non valido.", "Invalid NFC UID."))
 					!isValidSixDigitPin(pin) -> showStatus(tr("Il PIN utente deve contenere esattamente 6 cifre.", "The user PIN must contain exactly 6 digits."))
 					else ->
 					{
@@ -2350,6 +2383,33 @@ class MainActivity : Activity()
 	{
 		input.filters = arrayOf(InputFilter.LengthFilter(6))
 		input.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+	}
+
+	private fun configureHexUidInput(input: EditText)
+	{
+		input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+		var selfChange = false
+
+		input.addTextChangedListener(object : TextWatcher {
+			override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+			override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+			override fun afterTextChanged(s: Editable?) {
+				if (selfChange) return
+				val original = s?.toString() ?: ""
+				val raw = original.replace(":", "").uppercase().filter { it.isDigit() || it in 'A'..'F' }
+				val formatted = raw.chunked(2).joinToString(":")
+
+				if (formatted != original)
+				{
+					selfChange = true
+					input.setText(formatted)
+					val rawBeforeCursor = original.substring(0, input.selectionStart.coerceAtMost(original.length)).replace(":", "")
+					val newCursor = (rawBeforeCursor.length + rawBeforeCursor.length / 2).coerceAtMost(formatted.length)
+					input.setSelection(newCursor)
+					selfChange = false
+				}
+			}
+		})
 	}
 
 	private fun isValidSixDigitPin(pin: String): Boolean
@@ -2452,9 +2512,15 @@ class MainActivity : Activity()
 		return name.isNotEmpty() && name.length <= 32 && !name.contains(';') && !name.contains('=')
 	}
 
+	private fun normalizeUserUid(uid: String): String
+	{
+		return uid.replace(":", "").trim().uppercase()
+	}
+
 	private fun isValidUserUid(uid: String): Boolean
 	{
-		return uid.isNotEmpty() && uid.length <= 32 && uid.all { it.isDigit() || it in 'A'..'F' }
+		val filteredUid = uid.replace(":", "")
+		return filteredUid.isNotEmpty() && filteredUid.length <= 32 && uid.all { it == ':' || it.isDigit() || it in 'A'..'F' } && filteredUid.all { it.isDigit() || it in 'A'..'F' }
 	}
 
 	private fun parseProtocolValues(body: String): Map<String, String>
