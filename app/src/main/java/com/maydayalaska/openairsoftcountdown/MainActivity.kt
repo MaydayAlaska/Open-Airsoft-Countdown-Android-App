@@ -1983,6 +1983,19 @@ class MainActivity : Activity()
 
 			val positiveButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
 			positiveButton.isEnabled = false
+			positiveButton.setOnClickListener {
+				val pin = input.text.toString().trim()
+				val valid = pin.length == 6 && pin.all { it.isDigit() }
+
+				if (!valid)
+				{
+					errorLabel.visibility = View.VISIBLE
+					return@setOnClickListener
+				}
+
+				sendCommand("LOGIN:$pin")
+				dialog.dismiss()
+			}
 
 			input.addTextChangedListener(object : TextWatcher {
 				override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
