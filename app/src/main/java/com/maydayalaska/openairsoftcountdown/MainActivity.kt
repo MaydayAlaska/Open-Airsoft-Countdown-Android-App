@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
@@ -27,6 +28,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.text.Editable
 import android.text.InputFilter
 import android.text.InputType
@@ -56,8 +59,14 @@ import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.util.Base64
 import java.nio.charset.Charset
+import java.security.KeyStore
 import java.util.UUID
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : Activity()
 {
@@ -68,6 +77,13 @@ class MainActivity : Activity()
 		const val PreferencesName = "open_airsoft_countdown_settings"
 		const val ThemePreferenceKey = "theme_mode"
 		const val LanguagePreferenceKey = "app_language"
+		const val SavedDeviceAddressesKey = "saved_device_addresses"
+		const val SavedDeviceNameKeyPrefix = "saved_device_name_"
+		const val SavedDevicePinKeyPrefix = "saved_device_pin_"
+		const val SavedDevicePinKeyAlias = "open_airsoft_countdown_saved_device_pins"
+		const val EncryptedPinPrefix = "enc:"
+		const val PinCipherTransformation = "AES/GCM/NoPadding"
+		const val LoginResponseTimeoutMs = 5000L
 		const val ShortUserUidHexLength = 8
 		const val LongUserUidHexLength = 14
 		const val FirmwareRepositoryUrl = "https://github.com/MaydayAlaska/Open-Airsoft-Countdown"
@@ -171,6 +187,12 @@ class MainActivity : Activity()
 		val pin: String
 	)
 
+	private data class SavedDevice(
+		val address: String,
+		val name: String,
+		val pin: String
+	)
+
 	private val handler = Handler(Looper.getMainLooper())
 	private val foundDevices = linkedMapOf<String, BluetoothDevice>()
 
@@ -181,10 +203,18 @@ class MainActivity : Activity()
 	private var isScanning = false
 	private var isConnected = false
 	private var selectedDeviceName = "--"
+	private var selectedDeviceAddress = ""
 	private var currentScreen = Screen.Main
 	private var loadUsersAfterConfig = false
-	private var shouldOpenPinDialogAfterConnection = false
+	private var shouldAuthenticateAfterConnection = false
 	private var pinDialogAlreadyShown = false
+	private var pendingLoginPin: String? = null
+	private var pendingLoginWasAutomatic = false
+	private var loginAttemptId = 0L
+	private var skipSavingPendingLogin = false
+	private var isSessionAuthenticated = false
+	private var isPostLoginSyncInProgress = false
+	private var activePinDialog: AlertDialog? = null
 	private var pendingConfigRestartDialog = false
 	private var isDrawerOpen = false
 	private var themeMode = ThemeMode.System
@@ -276,8 +306,14 @@ class MainActivity : Activity()
 
 	private val gattCallback = object : BluetoothGattCallback()
 	{
+		@SuppressLint("MissingPermission")
 		override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int)
 		{
+			if (!isCurrentGatt(gatt))
+			{
+				return
+			}
+
 			runOnUiThreadSafe {
 				if (newState == BluetoothProfile.STATE_CONNECTED)
 				{
@@ -292,16 +328,31 @@ class MainActivity : Activity()
 					}
 
 					gatt.requestMtu(PreferredMtu)
-					handler.postDelayed({ discoverServicesIfConnected() }, 1500)
+					postForCurrentConnection(1500) {
+						if (commandCharacteristic == null)
+						{
+							discoverServicesIfConnected()
+						}
+					}
 				}
 				else if (newState == BluetoothProfile.STATE_DISCONNECTED)
 				{
+					dismissActivePinDialog()
+					if (hasConnectPermission()) gatt.close()
+					bluetoothGatt = null
 					isConnected = false
 					commandCharacteristic = null
 					responseCharacteristic = null
-					shouldOpenPinDialogAfterConnection = false
+					shouldAuthenticateAfterConnection = false
 					pinDialogAlreadyShown = false
+					pendingLoginPin = null
+					pendingLoginWasAutomatic = false
+					loginAttemptId++
+					skipSavingPendingLogin = false
+					isSessionAuthenticated = false
+					isPostLoginSyncInProgress = false
 					selectedDeviceName = "--"
+					selectedDeviceAddress = ""
 					loadUsersAfterConfig = false
 					clearCachedStatus()
 					updateSelectedDeviceLabel()
@@ -320,6 +371,11 @@ class MainActivity : Activity()
 
 		override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int)
 		{
+			if (!isCurrentGatt(gatt))
+			{
+				return
+			}
+
 			runOnUiThreadSafe {
 				showStatus(tr("MTU impostato: $mtu. Ricerca servizi...", "MTU set to $mtu. Discovering services..."))
 				discoverServicesIfConnected()
@@ -328,6 +384,11 @@ class MainActivity : Activity()
 
 		override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int)
 		{
+			if (!isCurrentGatt(gatt))
+			{
+				return
+			}
+
 			runOnUiThreadSafe {
 				if (status != BluetoothGatt.GATT_SUCCESS)
 				{
@@ -352,28 +413,73 @@ class MainActivity : Activity()
 					return@runOnUiThreadSafe
 				}
 
-				enableNotifications(gatt, responseCharacteristic!!)
+				if (!enableNotifications(gatt, responseCharacteristic!!))
+				{
+					showStatus(tr("Impossibile attivare le notifiche BLE.", "Unable to enable BLE notifications."))
+					return@runOnUiThreadSafe
+				}
+
+				showStatus(tr("Attivazione notifiche BLE...", "Enabling BLE notifications..."))
+			}
+		}
+
+		override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int)
+		{
+			if (!isCurrentGatt(gatt) || descriptor.uuid != ClientConfigurationDescriptorUuid)
+			{
+				return
+			}
+
+			runOnUiThreadSafe {
+				if (status != BluetoothGatt.GATT_SUCCESS)
+				{
+					showStatus(tr("Errore attivazione notifiche BLE: $status", "Error enabling BLE notifications: $status"))
+					return@runOnUiThreadSafe
+				}
+
 				showStatus(tr("Dispositivo pronto.", "Device ready."))
 				updateVisibleButtons()
-				sendCommand("STATUS")
 
-				if (shouldOpenPinDialogAfterConnection && !pinDialogAlreadyShown)
+				if (shouldAuthenticateAfterConnection && !pinDialogAlreadyShown)
 				{
-					pinDialogAlreadyShown = true
-					showPinDialog()
+					authenticateConnectedDevice()
 				}
 			}
 		}
 
 		override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic)
 		{
+			if (!isCurrentGatt(gatt)) return
 			val value = characteristic.value ?: return
 			handleBleResponse(String(value, Charset.forName("UTF-8")))
 		}
 
 		override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray)
 		{
+			if (!isCurrentGatt(gatt)) return
 			handleBleResponse(String(value, Charset.forName("UTF-8")))
+		}
+
+		override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int)
+		{
+			if (!isCurrentGatt(gatt) || characteristic.uuid != CommandCharacteristicUuid || status == BluetoothGatt.GATT_SUCCESS)
+			{
+				return
+			}
+
+			runOnUiThreadSafe {
+				if (pendingLoginPin != null)
+				{
+					handlePendingLoginFailure()
+				}
+				else if (isPostLoginSyncInProgress)
+				{
+					isPostLoginSyncInProgress = false
+					loadUsersAfterConfig = false
+					showStatus(tr("Sincronizzazione iniziale non riuscita.", "Initial synchronization failed."))
+					updateVisibleButtons()
+				}
+			}
 		}
 	}
 
@@ -863,6 +969,12 @@ class MainActivity : Activity()
 		disconnectButton = createActionButton(tr("Disconnetti", "Disconnect"), ButtonStyle.Danger, false) { disconnect() }
 		connectionCard.addView(disconnectButton, matchWrapWithTopMargin(8))
 		connectionCard.addView(createActionButton(tr("Richiedi stato", "Request status"), ButtonStyle.Outline, true) { sendCommand("STATUS") }, matchWrapWithTopMargin(8))
+		connectionCard.addView(
+			createActionButton(tr("Dispositivi salvati", "Saved devices"), ButtonStyle.Secondary, false) {
+				showSavedDevicesDialog()
+			},
+			matchWrapWithTopMargin(8)
+		)
 
 		addSectionLabel(tr("Dispositivi trovati", "Devices found"))
 		deviceListLayout = LinearLayout(this)
@@ -1589,6 +1701,195 @@ class MainActivity : Activity()
 			.apply()
 	}
 
+	private fun loadSavedDevices(): List<SavedDevice>
+	{
+		val preferences = getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+		val addresses = preferences.getStringSet(SavedDeviceAddressesKey, emptySet<String>())
+			?.toSet()
+			.orEmpty()
+
+		return addresses.mapNotNull { storedAddress ->
+			val address = normalizeDeviceAddress(storedAddress)
+			val name = preferences.getString(SavedDeviceNameKeyPrefix + address, null)?.trim()
+			val storedPin = preferences.getString(SavedDevicePinKeyPrefix + address, null)
+			val pin = storedPin?.let { decodeSavedPin(it) }
+
+			if (address.isEmpty() || name.isNullOrEmpty() || pin == null || !isValidSixDigitPin(pin))
+			{
+				null
+			}
+			else
+			{
+				SavedDevice(address, name, pin)
+			}
+		}.sortedWith(compareBy<SavedDevice> { it.name.lowercase() }.thenBy { it.address })
+	}
+
+	private fun findSavedDevice(address: String): SavedDevice?
+	{
+		val normalizedAddress = normalizeDeviceAddress(address)
+		return loadSavedDevices().firstOrNull { it.address == normalizedAddress }
+	}
+
+	private fun saveAuthenticatedDevice(address: String, scannedName: String, pin: String): Boolean
+	{
+		val normalizedAddress = normalizeDeviceAddress(address)
+
+		if (normalizedAddress.isEmpty() || !isValidSixDigitPin(pin))
+		{
+			return false
+		}
+
+		val encryptedPin = encodeSavedPin(pin) ?: return false
+
+		val previous = findSavedDevice(normalizedAddress)
+		val cleanScannedName = scannedName.trim()
+		val savedName = if (cleanScannedName.isEmpty() || isFallbackDeviceName(cleanScannedName))
+		{
+			previous?.name ?: cleanScannedName.ifEmpty { normalizedAddress }
+		}
+		else
+		{
+			cleanScannedName
+		}
+
+		val preferences = getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+		val addresses = preferences.getStringSet(SavedDeviceAddressesKey, emptySet<String>())
+			?.toMutableSet()
+			?: mutableSetOf()
+		addresses.add(normalizedAddress)
+
+		return preferences.edit()
+			.putStringSet(SavedDeviceAddressesKey, addresses.toSet())
+			.putString(SavedDeviceNameKeyPrefix + normalizedAddress, savedName)
+			.putString(SavedDevicePinKeyPrefix + normalizedAddress, encryptedPin)
+			.commit()
+	}
+
+	private fun updateSavedDeviceName(address: String, name: String)
+	{
+		val savedDevice = findSavedDevice(address) ?: return
+		val cleanName = name.trim()
+
+		if (cleanName.isEmpty())
+		{
+			return
+		}
+
+		getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+			.edit()
+			.putString(SavedDeviceNameKeyPrefix + savedDevice.address, cleanName)
+			.apply()
+	}
+
+	private fun deleteSavedDevice(address: String)
+	{
+		val normalizedAddress = normalizeDeviceAddress(address)
+		val preferences = getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+		val addresses = preferences.getStringSet(SavedDeviceAddressesKey, emptySet<String>())
+			?.toMutableSet()
+			?: mutableSetOf()
+		addresses.removeAll { normalizeDeviceAddress(it) == normalizedAddress }
+
+		preferences.edit()
+			.putStringSet(SavedDeviceAddressesKey, addresses.toSet())
+			.remove(SavedDeviceNameKeyPrefix + normalizedAddress)
+			.remove(SavedDevicePinKeyPrefix + normalizedAddress)
+			.apply()
+	}
+
+	private fun encodeSavedPin(pin: String): String?
+	{
+		return try
+		{
+			val cipher = Cipher.getInstance(PinCipherTransformation)
+			cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSavedDevicePinKey())
+			val encryptedPin = cipher.doFinal(pin.toByteArray(Charsets.UTF_8))
+			val initializationVector = cipher.iv
+			val payload = ByteArray(1 + initializationVector.size + encryptedPin.size)
+			payload[0] = initializationVector.size.toByte()
+			initializationVector.copyInto(payload, 1)
+			encryptedPin.copyInto(payload, 1 + initializationVector.size)
+			EncryptedPinPrefix + Base64.encodeToString(payload, Base64.NO_WRAP)
+		}
+		catch (_: Exception)
+		{
+			null
+		}
+	}
+
+	private fun decodeSavedPin(storedPin: String): String?
+	{
+		if (!storedPin.startsWith(EncryptedPinPrefix))
+		{
+			return storedPin.takeIf { isValidSixDigitPin(it) }
+		}
+
+		return try
+		{
+			val payload = Base64.decode(storedPin.removePrefix(EncryptedPinPrefix), Base64.NO_WRAP)
+
+			if (payload.isEmpty())
+			{
+				return null
+			}
+
+			val initializationVectorLength = payload[0].toInt() and 0xFF
+
+			if (initializationVectorLength !in 12..16 || payload.size <= 1 + initializationVectorLength)
+			{
+				return null
+			}
+
+			val initializationVector = payload.copyOfRange(1, 1 + initializationVectorLength)
+			val encryptedPin = payload.copyOfRange(1 + initializationVectorLength, payload.size)
+			val cipher = Cipher.getInstance(PinCipherTransformation)
+			cipher.init(
+				Cipher.DECRYPT_MODE,
+				getOrCreateSavedDevicePinKey(),
+				GCMParameterSpec(128, initializationVector)
+			)
+			String(cipher.doFinal(encryptedPin), Charsets.UTF_8).takeIf { isValidSixDigitPin(it) }
+		}
+		catch (_: Exception)
+		{
+			null
+		}
+	}
+
+	private fun getOrCreateSavedDevicePinKey(): SecretKey
+	{
+		val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+		val existingKey = keyStore.getKey(SavedDevicePinKeyAlias, null) as? SecretKey
+
+		if (existingKey != null)
+		{
+			return existingKey
+		}
+
+		val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+		keyGenerator.init(
+			KeyGenParameterSpec.Builder(
+				SavedDevicePinKeyAlias,
+				KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+			)
+				.setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+				.setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+				.build()
+		)
+		return keyGenerator.generateKey()
+	}
+
+	private fun normalizeDeviceAddress(address: String): String
+	{
+		return address.trim().uppercase()
+	}
+
+	private fun isFallbackDeviceName(name: String): Boolean
+	{
+		return name == "--" || name == "Dispositivo BLE" || name == "BLE device"
+	}
+
 	private fun applyAppLanguage(language: AppLanguage)
 	{
 		saveAppLanguage(language)
@@ -1778,11 +2079,25 @@ class MainActivity : Activity()
 	{
 		val layout = deviceListLayout ?: return
 		val button = createActionButton("$name\n$address", ButtonStyle.Secondary, false) {
+			if (bluetoothGatt != null)
+			{
+				showStatus(tr("Disconnetti il dispositivo corrente prima di collegarne un altro.", "Disconnect the current device before connecting another one."))
+				return@createActionButton
+			}
+
 			stopScan()
+			dismissActivePinDialog()
 			selectedDeviceName = name
+			selectedDeviceAddress = normalizeDeviceAddress(address)
 			updateSelectedDeviceLabel()
-			shouldOpenPinDialogAfterConnection = true
+			shouldAuthenticateAfterConnection = true
 			pinDialogAlreadyShown = false
+			pendingLoginPin = null
+			pendingLoginWasAutomatic = false
+			loginAttemptId++
+			skipSavingPendingLogin = false
+			isSessionAuthenticated = false
+			isPostLoginSyncInProgress = false
 			connectToDevice(device)
 		}
 		button.gravity = Gravity.CENTER_VERTICAL or Gravity.START
@@ -1802,6 +2117,13 @@ class MainActivity : Activity()
 			return
 		}
 
+		if (bluetoothGatt != null)
+		{
+			showStatus(tr("È già in corso una connessione Bluetooth.", "A Bluetooth connection is already in progress."))
+			return
+		}
+
+		selectedDeviceAddress = normalizeDeviceAddress(device.address)
 		showStatus(tr("Connessione a ${device.address}...", "Connecting to ${device.address}..."))
 		bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
 		updateVisibleButtons()
@@ -1886,13 +2208,212 @@ class MainActivity : Activity()
 			.show()
 	}
 
+	private fun showSavedDevicesDialog()
+	{
+		val dialogContent = LinearLayout(this)
+		dialogContent.orientation = LinearLayout.VERTICAL
+		dialogContent.setPadding(dp(24), dp(8), dp(24), dp(8))
+
+		val scrollView = ScrollView(this)
+		val devicesLayout = LinearLayout(this)
+		devicesLayout.orientation = LinearLayout.VERTICAL
+		scrollView.addView(
+			devicesLayout,
+			FrameLayout.LayoutParams(
+				FrameLayout.LayoutParams.MATCH_PARENT,
+				FrameLayout.LayoutParams.WRAP_CONTENT
+			)
+		)
+		dialogContent.addView(scrollView, matchWrap())
+		renderSavedDevicesList(devicesLayout)
+
+		AlertDialog.Builder(this)
+			.setTitle(tr("Dispositivi salvati", "Saved devices"))
+			.setView(dialogContent)
+			.setPositiveButton(tr("Chiudi", "Close"), null)
+			.show()
+	}
+
+	private fun renderSavedDevicesList(layout: LinearLayout)
+	{
+		layout.removeAllViews()
+		val savedDevices = loadSavedDevices()
+
+		if (savedDevices.isEmpty())
+		{
+			val emptyLabel = TextView(this)
+			emptyLabel.text = tr("Nessun dispositivo salvato.", "No saved devices.")
+			emptyLabel.textSize = 15f
+			emptyLabel.setTextColor(palette.textSecondary)
+			emptyLabel.setPadding(0, dp(8), 0, dp(8))
+			layout.addView(emptyLabel, matchWrap())
+			return
+		}
+
+		for (savedDevice in savedDevices)
+		{
+			val row = LinearLayout(this)
+			row.orientation = LinearLayout.HORIZONTAL
+			row.gravity = Gravity.CENTER_VERTICAL
+			row.setPadding(dp(14), dp(12), dp(10), dp(12))
+			row.background = roundedDrawable(palette.surfaceAlt, 15, palette.border, 1)
+
+			val deviceText = TextView(this)
+			deviceText.text = tr(
+				"Nome: ${savedDevice.name}\nMAC: ${savedDevice.address}",
+				"Name: ${savedDevice.name}\nMAC: ${savedDevice.address}"
+			)
+			deviceText.textSize = 15f
+			deviceText.setTextColor(palette.textPrimary)
+			deviceText.setLineSpacing(0f, 1.08f)
+			row.addView(deviceText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+			val deleteButton = createUserIconButton(
+				R.drawable.ic_delete,
+				tr("Elimina ${savedDevice.name}", "Delete ${savedDevice.name}"),
+				palette.danger
+			) {
+				showDeleteSavedDeviceDialog(savedDevice) {
+					renderSavedDevicesList(layout)
+				}
+			}
+			row.addView(deleteButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+
+			val params = matchWrap()
+			params.setMargins(0, 0, 0, dp(10))
+			layout.addView(row, params)
+		}
+	}
+
+	private fun showDeleteSavedDeviceDialog(savedDevice: SavedDevice, onDeleted: () -> Unit)
+	{
+		AlertDialog.Builder(this)
+			.setTitle(tr("Elimina dispositivo", "Delete device"))
+			.setMessage(
+				tr(
+					"Vuoi eliminare ${savedDevice.name} (${savedDevice.address}) dai dispositivi salvati?",
+					"Do you want to remove ${savedDevice.name} (${savedDevice.address}) from saved devices?"
+				)
+			)
+			.setPositiveButton(tr("Elimina", "Delete")) { _, _ ->
+				deleteSavedDevice(savedDevice.address)
+
+				if (normalizeDeviceAddress(selectedDeviceAddress) == savedDevice.address && pendingLoginWasAutomatic)
+				{
+					skipSavingPendingLogin = true
+				}
+
+				showStatus(tr("Dispositivo salvato eliminato.", "Saved device removed."))
+				onDeleted()
+			}
+			.setNegativeButton(tr("Annulla", "Cancel"), null)
+			.show()
+	}
+
+	private fun authenticateConnectedDevice()
+	{
+		if (!isConnected || commandCharacteristic == null || pinDialogAlreadyShown)
+		{
+			return
+		}
+
+		val savedDevice = findSavedDevice(selectedDeviceAddress)
+
+		if (savedDevice == null)
+		{
+			showPinDialog()
+			return
+		}
+
+		showStatus(tr("Invio automatico del PIN salvato...", "Sending saved PIN automatically..."))
+		attemptLogin(savedDevice.pin, automatic = true)
+	}
+
+	private fun attemptLogin(pin: String, automatic: Boolean)
+	{
+		if (!isValidSixDigitPin(pin) || !isConnected || bluetoothGatt == null || commandCharacteristic == null)
+		{
+			showStatus(tr("Impossibile inviare il PIN: dispositivo non pronto.", "Unable to send PIN: device not ready."))
+			return
+		}
+
+		pinDialogAlreadyShown = true
+		pendingLoginPin = pin
+		pendingLoginWasAutomatic = automatic
+		skipSavingPendingLogin = false
+		isSessionAuthenticated = false
+		isPostLoginSyncInProgress = false
+		val currentAttemptId = ++loginAttemptId
+		updateVisibleButtons()
+
+		if (!sendCommand("LOGIN:$pin"))
+		{
+			handlePendingLoginFailure()
+			return
+		}
+
+		postForCurrentConnection(LoginResponseTimeoutMs) {
+			if (loginAttemptId == currentAttemptId && pendingLoginPin != null)
+			{
+				handlePendingLoginFailure()
+			}
+		}
+	}
+
+	private fun handlePendingLoginFailure()
+	{
+		if (pendingLoginPin == null)
+		{
+			return
+		}
+
+		val automaticLoginFailed = pendingLoginWasAutomatic
+		pendingLoginPin = null
+		pendingLoginWasAutomatic = false
+		skipSavingPendingLogin = false
+		loginAttemptId++
+		pinDialogAlreadyShown = false
+		isSessionAuthenticated = false
+		updateVisibleButtons()
+
+		val message = if (automaticLoginFailed)
+		{
+			tr(
+				"Il PIN salvato non è più valido. Inserisci il nuovo PIN.",
+				"The saved PIN is no longer valid. Enter the new PIN."
+			)
+		}
+		else
+		{
+			tr("PIN non corretto. Riprova.", "Incorrect PIN. Try again.")
+		}
+
+		showStatus(message)
+		Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+		postForCurrentConnection(150) {
+			if (!pinDialogAlreadyShown)
+			{
+				showPinDialog()
+			}
+		}
+	}
+
 	private fun showPinDialog()
 	{
+		if (activePinDialog?.isShowing == true)
+		{
+			return
+		}
+
 		if (commandCharacteristic == null)
 		{
 			showStatus(tr("Dispositivo non pronto.", "Device not ready."))
 			return
 		}
+
+		pinDialogAlreadyShown = true
+		val dialogGatt = bluetoothGatt
+		val dialogDeviceAddress = selectedDeviceAddress
 
 		val fieldContainer = FrameLayout(this)
 		fieldContainer.background = roundedDrawable(palette.surfaceAlt, 15, palette.border, 1)
@@ -1976,6 +2497,13 @@ class MainActivity : Activity()
 			.setPositiveButton("Login", null)
 			.setNegativeButton(tr("Annulla", "Cancel"), null)
 			.create()
+		activePinDialog = dialog
+		dialog.setOnDismissListener {
+			if (activePinDialog === dialog)
+			{
+				activePinDialog = null
+			}
+		}
 
 		dialog.setOnShowListener {
 			pinVisible = false
@@ -1988,6 +2516,13 @@ class MainActivity : Activity()
 			val positiveButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
 			positiveButton.isEnabled = false
 			positiveButton.setOnClickListener {
+				if (dialogGatt == null || dialogGatt !== bluetoothGatt || dialogDeviceAddress != selectedDeviceAddress || !isConnected)
+				{
+					showStatus(tr("La connessione al dispositivo è cambiata.", "The device connection has changed."))
+					dialog.dismiss()
+					return@setOnClickListener
+				}
+
 				val pin = input.text.toString().trim()
 				val valid = pin.length == 6 && pin.all { it.isDigit() }
 
@@ -1997,7 +2532,7 @@ class MainActivity : Activity()
 					return@setOnClickListener
 				}
 
-				sendCommand("LOGIN:$pin")
+				attemptLogin(pin, automatic = false)
 				dialog.dismiss()
 			}
 
@@ -2035,20 +2570,23 @@ class MainActivity : Activity()
 	}
 
 	@SuppressLint("MissingPermission")
-	private fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic)
+	private fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic): Boolean
 	{
 		if (!hasConnectPermission())
 		{
-			return
+			return false
 		}
 
-		gatt.setCharacteristicNotification(characteristic, true)
-
-		val descriptor = characteristic.getDescriptor(ClientConfigurationDescriptorUuid) ?: return
-
-		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+		if (!gatt.setCharacteristicNotification(characteristic, true))
 		{
-			gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+			return false
+		}
+
+		val descriptor = characteristic.getDescriptor(ClientConfigurationDescriptorUuid) ?: return false
+
+		return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+		{
+			gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
 		}
 		else
 		{
@@ -2058,7 +2596,21 @@ class MainActivity : Activity()
 	}
 
 	@SuppressLint("MissingPermission")
-	private fun sendCommand(command: String)
+	private fun sendPostLoginSyncCommand(command: String)
+	{
+		if (sendCommand(command))
+		{
+			return
+		}
+
+		isPostLoginSyncInProgress = false
+		loadUsersAfterConfig = false
+		showStatus(tr("Sincronizzazione iniziale non riuscita.", "Initial synchronization failed."))
+		updateVisibleButtons()
+	}
+
+	@SuppressLint("MissingPermission")
+	private fun sendCommand(command: String): Boolean
 	{
 		val gatt = bluetoothGatt
 		val characteristic = commandCharacteristic
@@ -2066,14 +2618,14 @@ class MainActivity : Activity()
 		if (gatt == null || characteristic == null || !hasConnectPermission())
 		{
 			showStatus(tr("Dispositivo non pronto.", "Device not ready."))
-			return
+			return false
 		}
 
 		val bytes = command.toByteArray(Charset.forName("UTF-8"))
 
-		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+		val writeStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
 		{
-			gatt.writeCharacteristic(characteristic, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+			gatt.writeCharacteristic(characteristic, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
 		}
 		else
 		{
@@ -2082,12 +2634,22 @@ class MainActivity : Activity()
 			gatt.writeCharacteristic(characteristic)
 		}
 
-		showStatus(tr("Comando inviato: $command", "Command sent: $command"))
+		if (!writeStarted)
+		{
+			showStatus(tr("Invio comando BLE non riuscito.", "BLE command could not be sent."))
+			return false
+		}
+
+		val displayedCommand = if (command.startsWith("LOGIN:")) "LOGIN:******" else command
+		showStatus(tr("Comando inviato: $displayedCommand", "Command sent: $displayedCommand"))
+		return true
 	}
 
 	@SuppressLint("MissingPermission")
 	private fun disconnect()
 	{
+		dismissActivePinDialog()
+
 		if (hasConnectPermission())
 		{
 			bluetoothGatt?.disconnect()
@@ -2098,9 +2660,16 @@ class MainActivity : Activity()
 		commandCharacteristic = null
 		responseCharacteristic = null
 		isConnected = false
-		shouldOpenPinDialogAfterConnection = false
+		shouldAuthenticateAfterConnection = false
 		pinDialogAlreadyShown = false
+		pendingLoginPin = null
+		pendingLoginWasAutomatic = false
+		loginAttemptId++
+		skipSavingPendingLogin = false
+		isSessionAuthenticated = false
+		isPostLoginSyncInProgress = false
 		selectedDeviceName = "--"
+		selectedDeviceAddress = ""
 		loadUsersAfterConfig = false
 		clearCachedStatus()
 		updateSelectedDeviceLabel()
@@ -2132,8 +2701,19 @@ class MainActivity : Activity()
 					isReceivingUsers = false
 					pendingConfigRestartDialog = false
 					loadUsersAfterConfig = false
-					showStatus(response)
-					Toast.makeText(this, response, Toast.LENGTH_SHORT).show()
+					isPostLoginSyncInProgress = false
+
+					if (pendingLoginPin != null && response == "ERR:LOGIN")
+					{
+						handlePendingLoginFailure()
+					}
+					else
+					{
+						showStatus(response)
+						Toast.makeText(this, response, Toast.LENGTH_SHORT).show()
+					}
+
+					updateVisibleButtons()
 				}
 				response.startsWith("OK:") ->
 				{
@@ -2142,9 +2722,40 @@ class MainActivity : Activity()
 
 					if (response.startsWith("OK:LOGIN"))
 					{
+						var credentialsSaveFailed = false
+						pendingLoginPin?.let { authenticatedPin ->
+							if (!skipSavingPendingLogin)
+							{
+								credentialsSaveFailed = !saveAuthenticatedDevice(
+									selectedDeviceAddress,
+									selectedDeviceName,
+									authenticatedPin
+								)
+							}
+						}
+						pendingLoginPin = null
+						pendingLoginWasAutomatic = false
+						loginAttemptId++
+						skipSavingPendingLogin = false
+						isSessionAuthenticated = true
+						isPostLoginSyncInProgress = true
+						shouldAuthenticateAfterConnection = false
+						pinDialogAlreadyShown = true
+						dismissActivePinDialog()
+						updateVisibleButtons()
+
+						if (credentialsSaveFailed)
+						{
+							Toast.makeText(
+								this,
+								tr("Accesso riuscito, ma non è stato possibile salvare il dispositivo.", "Login succeeded, but the device could not be saved."),
+								Toast.LENGTH_LONG
+							).show()
+						}
+
 						loadUsersAfterConfig = true
 						showStatus(tr("Login eseguito. Lettura configurazione...", "Login successful. Reading configuration..."))
-						handler.postDelayed({ sendCommand("GETCONFIG") }, 150)
+						postForCurrentConnection(150) { sendPostLoginSyncCommand("GETCONFIG") }
 					}
 
 					if (response.startsWith("OK:CONFIG_SAVED") && pendingConfigRestartDialog)
@@ -2160,9 +2771,10 @@ class MainActivity : Activity()
 	private fun parseConfig(response: String)
 	{
 		val values = parseProtocolValues(response.removePrefix("CONFIG:"))
+		val receivedBleName = values["bleName"]?.trim()?.takeIf { it.isNotEmpty() }
 
 		deviceConfig.adminPin = values["adminPin"] ?: deviceConfig.adminPin
-		deviceConfig.bleName = values["bleName"] ?: deviceConfig.bleName
+		deviceConfig.bleName = receivedBleName ?: deviceConfig.bleName
 		values["language"]?.let {
 			deviceConfig.language = if (it == "en") "en" else "it"
 		}
@@ -2174,13 +2786,20 @@ class MainActivity : Activity()
 		deviceConfig.maxErrorCount = values["maxErrorCount"] ?: deviceConfig.maxErrorCount
 		deviceConfig.errorCountdownSeconds = values["errorCountdownSeconds"] ?: deviceConfig.errorCountdownSeconds
 
+		if (isSessionAuthenticated && selectedDeviceAddress.isNotEmpty() && receivedBleName != null)
+		{
+			updateSavedDeviceName(selectedDeviceAddress, receivedBleName)
+			selectedDeviceName = receivedBleName
+			updateSelectedDeviceLabel()
+		}
+
 		updateConfigViews()
 
 		if (loadUsersAfterConfig)
 		{
 			loadUsersAfterConfig = false
 			showStatus(tr("Configurazione letta. Lettura utenti...", "Configuration loaded. Reading users..."))
-			handler.postDelayed({ sendCommand("GETUSERS") }, 150)
+			postForCurrentConnection(150) { sendPostLoginSyncCommand("GETUSERS") }
 		}
 		else
 		{
@@ -2242,7 +2861,9 @@ class MainActivity : Activity()
 	private fun finishUsersResponse()
 	{
 		isReceivingUsers = false
+		isPostLoginSyncInProgress = false
 		updateUsersViews()
+		updateVisibleButtons()
 
 		val expected = expectedUserCount
 		showStatus(
@@ -2715,14 +3336,40 @@ class MainActivity : Activity()
 	private fun updateVisibleButtons()
 	{
 		scanButton?.text = if (isScanning) tr("Ferma scansione", "Stop scan") else tr("Scansiona dispositivo", "Scan for device")
-		disconnectButton?.isEnabled = isConnected
+		scanButton?.isEnabled = isScanning || bluetoothGatt == null
+		disconnectButton?.isEnabled = bluetoothGatt != null
 
-		val ready = isConnected && commandCharacteristic != null
+		val ready = isConnected && commandCharacteristic != null && isSessionAuthenticated &&
+			pendingLoginPin == null && !isPostLoginSyncInProgress
 		for (button in commandButtons)
 		{
 			button.isEnabled = ready
 			button.alpha = if (ready) 1f else 0.45f
 		}
+	}
+
+	private fun isCurrentGatt(gatt: BluetoothGatt): Boolean
+	{
+		return gatt === bluetoothGatt
+	}
+
+	private fun postForCurrentConnection(delayMs: Long, action: () -> Unit)
+	{
+		val expectedGatt = bluetoothGatt ?: return
+		val expectedAddress = selectedDeviceAddress
+
+		handler.postDelayed({
+			if (expectedGatt === bluetoothGatt && expectedAddress == selectedDeviceAddress && isConnected)
+			{
+				action()
+			}
+		}, delayMs)
+	}
+
+	private fun dismissActivePinDialog()
+	{
+		activePinDialog?.dismiss()
+		activePinDialog = null
 	}
 
 	private fun runOnUiThreadSafe(action: () -> Unit)
