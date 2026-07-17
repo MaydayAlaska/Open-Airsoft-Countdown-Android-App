@@ -68,7 +68,8 @@ class MainActivity : Activity()
 		const val PreferencesName = "open_airsoft_countdown_settings"
 		const val ThemePreferenceKey = "theme_mode"
 		const val LanguagePreferenceKey = "app_language"
-		const val UserUidHexLength = 14
+		const val ShortUserUidHexLength = 8
+		const val LongUserUidHexLength = 14
 		const val FirmwareRepositoryUrl = "https://github.com/MaydayAlaska/Open-Airsoft-Countdown"
 		const val AndroidRepositoryUrl = "https://github.com/MaydayAlaska/Open-Airsoft-Countdown-Android-App"
 		const val MakerWorldProfileUrl = "https://makerworld.com/it/@maydayalaska"
@@ -2430,7 +2431,7 @@ class MainActivity : Activity()
 				val original = s?.toString() ?: ""
 				val raw = original.replace(":", "").uppercase()
 					.filter { it.isDigit() || it in 'A'..'F' }
-					.take(UserUidHexLength)
+					.take(LongUserUidHexLength)
 				val formatted = raw.chunked(2).joinToString(":")
 
 				if (formatted != original)
@@ -2453,7 +2454,7 @@ class MainActivity : Activity()
 					}
 				}
 
-				errorLabel.visibility = if (raw.isEmpty() || raw.length == UserUidHexLength) View.GONE else View.VISIBLE
+				errorLabel.visibility = if (raw.isEmpty() || isValidUserUidLength(raw.length)) View.GONE else View.VISIBLE
 			}
 		})
 	}
@@ -2566,7 +2567,12 @@ class MainActivity : Activity()
 	private fun isValidUserUid(uid: String): Boolean
 	{
 		val filteredUid = uid.replace(":", "")
-		return filteredUid.length == UserUidHexLength && uid.all { it == ':' || it.isDigit() || it in 'A'..'F' } && filteredUid.all { it.isDigit() || it in 'A'..'F' }
+		return isValidUserUidLength(filteredUid.length) && uid.all { it == ':' || it.isDigit() || it in 'A'..'F' } && filteredUid.all { it.isDigit() || it in 'A'..'F' }
+	}
+
+	private fun isValidUserUidLength(length: Int): Boolean
+	{
+		return length == ShortUserUidHexLength || length == LongUserUidHexLength
 	}
 
 	private fun parseProtocolValues(body: String): Map<String, String>
