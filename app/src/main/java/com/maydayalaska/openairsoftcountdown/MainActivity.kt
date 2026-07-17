@@ -68,6 +68,7 @@ class MainActivity : Activity()
 		const val PreferencesName = "open_airsoft_countdown_settings"
 		const val ThemePreferenceKey = "theme_mode"
 		const val LanguagePreferenceKey = "app_language"
+		const val UserUidHexLength = 14
 		const val FirmwareRepositoryUrl = "https://github.com/MaydayAlaska/Open-Airsoft-Countdown"
 		const val AndroidRepositoryUrl = "https://github.com/MaydayAlaska/Open-Airsoft-Countdown-Android-App"
 		const val MakerWorldProfileUrl = "https://makerworld.com/it/@maydayalaska"
@@ -1025,7 +1026,8 @@ class MainActivity : Activity()
 		addCardTitle(addCard, tr("Nuovo utente", "New user"))
 		val userNameInput = addStyledEditText(addCard, tr("Nome utente", "User name"), InputType.TYPE_CLASS_TEXT)
 		val userUidInput = addStyledEditText(addCard, "UID NFC", InputType.TYPE_CLASS_TEXT)
-		configureHexUidInput(userUidInput)
+		val userUidError = addUidErrorLabel(addCard)
+		configureHexUidInput(userUidInput, userUidError)
 		val userPinInput = addStyledEditText(addCard, tr("PIN utente (6 cifre)", "User PIN (6 digits)"), InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)
 		configureSixDigitPinInput(userPinInput)
 
@@ -1043,6 +1045,7 @@ class MainActivity : Activity()
 
 			if (!isValidUserUid(rawUid))
 			{
+				userUidError.visibility = View.VISIBLE
 				showStatus(tr("UID NFC non valido.", "Invalid NFC UID."))
 				return@createActionButton
 			}
@@ -2338,7 +2341,8 @@ class MainActivity : Activity()
 
 		addFieldLabel(dialogContent, "UID NFC")
 		val uidInput = addStyledEditText(dialogContent, "UID NFC", InputType.TYPE_CLASS_TEXT)
-		configureHexUidInput(uidInput)
+		val uidError = addUidErrorLabel(dialogContent)
+		configureHexUidInput(uidInput, uidError)
 		uidInput.setText(user.uid.chunked(2).joinToString(":"))
 
 		addFieldLabel(dialogContent, tr("PIN utente (6 cifre)", "User PIN (6 digits)"))
@@ -2364,7 +2368,11 @@ class MainActivity : Activity()
 				when
 				{
 					!isValidUserName(name) -> showStatus(tr("Nome utente non valido.", "Invalid user name."))
-					!isValidUserUid(rawUid) -> showStatus(tr("UID NFC non valido.", "Invalid NFC UID."))
+					!isValidUserUid(rawUid) ->
+					{
+						uidError.visibility = View.VISIBLE
+						showStatus(tr("UID NFC non valido.", "Invalid NFC UID."))
+					}
 					!isValidSixDigitPin(pin) -> showStatus(tr("Il PIN utente deve contenere esattamente 6 cifre.", "The user PIN must contain exactly 6 digits."))
 					else ->
 					{
@@ -2398,7 +2406,18 @@ class MainActivity : Activity()
 		input.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
 	}
 
-	private fun configureHexUidInput(input: EditText)
+	private fun addUidErrorLabel(parent: LinearLayout): TextView
+	{
+		val errorLabel = TextView(this)
+		errorLabel.text = tr("UID non valido", "Invalid UID")
+		errorLabel.setTextColor(palette.danger)
+		errorLabel.textSize = 14f
+		errorLabel.visibility = View.GONE
+		parent.addView(errorLabel, matchWrapWithTopMargin(4))
+		return errorLabel
+	}
+
+	private fun configureHexUidInput(input: EditText, errorLabel: TextView)
 	{
 		input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
 		var selfChange = false
@@ -2409,18 +2428,32 @@ class MainActivity : Activity()
 			override fun afterTextChanged(s: Editable?) {
 				if (selfChange) return
 				val original = s?.toString() ?: ""
-				val raw = original.replace(":", "").uppercase().filter { it.isDigit() || it in 'A'..'F' }
+				val raw = original.replace(":", "").uppercase()
+					.filter { it.isDigit() || it in 'A'..'F' }
+					.take(UserUidHexLength)
 				val formatted = raw.chunked(2).joinToString(":")
 
 				if (formatted != original)
 				{
+					val cursorBeforeFormatting = input.selectionStart.coerceIn(0, original.length)
+					val rawBeforeCursor = original.substring(0, cursorBeforeFormatting)
+						.filter { it.isDigit() || it.uppercaseChar() in 'A'..'F' }
+					val newCursor = (rawBeforeCursor.length + rawBeforeCursor.length / 2)
+						.coerceAtMost(formatted.length)
+
 					selfChange = true
-					input.setText(formatted)
-					val rawBeforeCursor = original.substring(0, input.selectionStart.coerceAtMost(original.length)).replace(":", "")
-					val newCursor = (rawBeforeCursor.length + rawBeforeCursor.length / 2).coerceAtMost(formatted.length)
-					input.setSelection(newCursor)
-					selfChange = false
+					try
+					{
+						input.setText(formatted)
+						input.setSelection(newCursor)
+					}
+					finally
+					{
+						selfChange = false
+					}
 				}
+
+				errorLabel.visibility = if (raw.isEmpty() || raw.length == UserUidHexLength) View.GONE else View.VISIBLE
 			}
 		})
 	}
@@ -2533,7 +2566,7 @@ class MainActivity : Activity()
 	private fun isValidUserUid(uid: String): Boolean
 	{
 		val filteredUid = uid.replace(":", "")
-		return filteredUid.isNotEmpty() && filteredUid.length <= 32 && uid.all { it == ':' || it.isDigit() || it in 'A'..'F' } && filteredUid.all { it.isDigit() || it in 'A'..'F' }
+		return filteredUid.length == UserUidHexLength && uid.all { it == ':' || it.isDigit() || it in 'A'..'F' } && filteredUid.all { it.isDigit() || it in 'A'..'F' }
 	}
 
 	private fun parseProtocolValues(body: String): Map<String, String>
