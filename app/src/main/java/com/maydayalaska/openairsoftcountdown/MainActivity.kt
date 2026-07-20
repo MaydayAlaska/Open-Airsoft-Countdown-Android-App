@@ -1417,21 +1417,32 @@ class MainActivity : Activity()
 		addCardTitle(infoCard, tr("Informazioni", "Information"))
 		addCenteredInfoLogo(infoCard)
 		addInfoRow(infoCard, tr("Versione", "Version"), "v1.30")
-		addInfoRow(infoCard, tr("Tema attivo", "Active theme"), if (isDarkTheme) tr("Scuro", "Dark") else tr("Chiaro", "Light"))
 
 		addCardDescription(infoCard, tr("Puoi trovare gli aggiornamenti qui:", "You can find updates here:"))
 		addCardDescription(infoCard, tr("Repository GitHub", "GitHub repositories"))
-		addGitHubLinkRow(
+		addExternalLinkRow(
 			infoCard,
 			"Open Airsoft Countdown",
 			tr("Firmware ESP32, hardware e documentazione", "ESP32 firmware, hardware, and documentation"),
-			FirmwareRepositoryUrl
+			FirmwareRepositoryUrl,
+			R.drawable.ic_github,
+			tr("Apri repository GitHub", "Open GitHub repository")
 		)
-		addGitHubLinkRow(
+		addExternalLinkRow(
 			infoCard,
 			tr("Applicazione Android", "Android application"),
 			tr("Codice sorgente dell'applicazione", "Application source code"),
-			AndroidRepositoryUrl
+			AndroidRepositoryUrl,
+			R.drawable.ic_github,
+			tr("Apri repository GitHub", "Open GitHub repository")
+		)
+		addExternalLinkRow(
+			infoCard,
+			"MakerWorld",
+			tr("Profilo MakerWorld di MaydayAlaska", "MaydayAlaska's MakerWorld profile"),
+			MakerWorldProfileUrl,
+			R.drawable.ic_makerworld,
+			tr("Apri MakerWorld", "Open MakerWorld")
 		)
 	}
 
@@ -1578,7 +1589,14 @@ class MainActivity : Activity()
 		parent.addView(row, matchWrap())
 	}
 
-	private fun addGitHubLinkRow(parent: LinearLayout, title: String, description: String, url: String)
+	private fun addExternalLinkRow(
+		parent: LinearLayout,
+		title: String,
+		description: String,
+		url: String,
+		iconResource: Int,
+		iconDescription: String
+	)
 	{
 		val row = LinearLayout(this)
 		row.orientation = LinearLayout.HORIZONTAL
@@ -1590,10 +1608,10 @@ class MainActivity : Activity()
 		row.setOnClickListener { openUrl(url) }
 
 		val icon = ImageButton(this)
-		icon.setImageResource(R.drawable.ic_github)
+		icon.setImageResource(iconResource)
 		icon.imageTintList = ColorStateList.valueOf(palette.textPrimary)
 		icon.background = null
-		icon.contentDescription = tr("Apri repository GitHub", "Open GitHub repository")
+		icon.contentDescription = iconDescription
 		icon.setPadding(dp(8), dp(8), dp(8), dp(8))
 		icon.setOnClickListener { openUrl(url) }
 		row.addView(icon, LinearLayout.LayoutParams(dp(48), dp(48)))
