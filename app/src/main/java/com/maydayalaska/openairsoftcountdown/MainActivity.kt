@@ -1342,6 +1342,7 @@ class MainActivity : Activity()
 	private fun renderSettingsScreen()
 	{
 		addPageHeader(tr("Impostazioni", "Settings"), tr("Personalizza l'aspetto e la lingua dell'applicazione.", "Customize the application appearance and language."))
+		renderInformationCard()
 
 		val themeCard = addCard()
 		addCardTitle(themeCard, tr("Tema", "Theme"))
@@ -1413,6 +1414,10 @@ class MainActivity : Activity()
 			}
 		}
 
+	}
+
+	private fun renderInformationCard()
+	{
 		val infoCard = addCard()
 		addCardTitle(infoCard, tr("Informazioni", "Information"))
 		addCenteredInfoLogo(infoCard)
@@ -1945,8 +1950,7 @@ class MainActivity : Activity()
 		isDarkTheme = resolveDarkTheme(mode)
 		setTheme(if (isDarkTheme) R.style.AppThemeDark else R.style.AppThemeLight)
 		palette = createPalette(isDarkTheme)
-		buildBaseUi()
-		renderCurrentScreen()
+		rebuildCurrentScreenPreservingScroll()
 
 		val modeName = when (mode)
 		{
@@ -2165,9 +2169,18 @@ class MainActivity : Activity()
 	{
 		saveAppLanguage(language)
 		appLanguage = language
+		rebuildCurrentScreenPreservingScroll()
+		showStatus(tr("Lingua applicata: Italiano", "Language applied: English"))
+	}
+
+	private fun rebuildCurrentScreenPreservingScroll()
+	{
+		val scrollPosition = scrollView.scrollY
 		buildBaseUi()
 		renderCurrentScreen()
-		showStatus(tr("Lingua applicata: Italiano", "Language applied: English"))
+		scrollView.post {
+			scrollView.scrollTo(0, scrollPosition)
+		}
 	}
 
 	private fun tr(italian: String, english: String): String
