@@ -36,13 +36,17 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.text.method.HideReturnsTransformationMethod
 import android.text.method.PasswordTransformationMethod
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewConfiguration
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import android.view.animation.AccelerateInterpolator
@@ -62,6 +66,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.util.Base64
+import android.util.TypedValue
 import java.nio.charset.Charset
 import java.security.KeyStore
 import java.util.UUID
@@ -172,6 +177,108 @@ class MainActivity : Activity()
 		val scrim: Int
 	)
 
+	private inner class LargeNumberPicker(context: Context) : NumberPicker(context)
+	{
+		private val selectedValueBackgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+			color = palette.surface
+		}
+		private val selectedValuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+			color = palette.textPrimary
+			textAlign = Paint.Align.CENTER
+			textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 36f, resources.displayMetrics)
+			typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+		}
+		private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+		private var initialTouchX = 0f
+		private var initialTouchY = 0f
+		private var isCenterTapCandidate = false
+
+		override fun draw(canvas: Canvas)
+		{
+			super.draw(canvas)
+			if (findInput()?.hasFocus() == true)
+			{
+				return
+			}
+
+			val centerY = height / 2f
+			val metrics = selectedValuePaint.fontMetrics
+			val halfOverlayHeight = maxOf(
+				dp(27).toFloat(),
+				(metrics.descent - metrics.ascent) / 2f + dp(4)
+			)
+			canvas.drawRect(0f, centerY - halfOverlayHeight, width.toFloat(), centerY + halfOverlayHeight, selectedValueBackgroundPaint)
+
+			val baseline = centerY - (metrics.ascent + metrics.descent) / 2f
+			canvas.drawText(formatTimerPart(value), width / 2f, baseline, selectedValuePaint)
+		}
+
+		private fun findInput(): EditText?
+		{
+			for (index in 0 until childCount)
+			{
+				val child = getChildAt(index)
+				if (child is EditText)
+				{
+					return child
+				}
+			}
+
+			return null
+		}
+
+		override fun onTouchEvent(event: MotionEvent): Boolean
+		{
+			when (event.actionMasked)
+			{
+				MotionEvent.ACTION_DOWN ->
+				{
+					initialTouchX = event.x
+					initialTouchY = event.y
+					isCenterTapCandidate = isWithinCenterValue(event.y)
+				}
+				MotionEvent.ACTION_MOVE ->
+				{
+					if (isCenterTapCandidate &&
+						(Math.abs(event.x - initialTouchX) > touchSlop || Math.abs(event.y - initialTouchY) > touchSlop))
+					{
+						isCenterTapCandidate = false
+					}
+				}
+				MotionEvent.ACTION_CANCEL -> isCenterTapCandidate = false
+			}
+
+			val handled = super.onTouchEvent(event)
+			if (event.actionMasked == MotionEvent.ACTION_UP && isCenterTapCandidate)
+			{
+				showNumericInput()
+				isCenterTapCandidate = false
+				return true
+			}
+
+			return handled
+		}
+
+		private fun isWithinCenterValue(y: Float): Boolean
+		{
+			val centerY = height / 2f
+			return y >= centerY - dp(32) && y <= centerY + dp(32)
+		}
+
+		private fun showNumericInput()
+		{
+			val input = findInput() ?: return
+			input.visibility = View.VISIBLE
+			input.requestFocus()
+			input.post {
+				input.selectAll()
+				val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+				inputMethodManager.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+			}
+			invalidate()
+		}
+	}
+
 	private data class DeviceConfig(
 		var adminPin: String = "000000",
 		var bleName: String = DeviceName,
@@ -198,7 +305,6 @@ class MainActivity : Activity()
 	)
 
 	private val handler = Handler(Looper.getMainLooper())
-	private val commitDurationSelection = Runnable { commitSelectedDuration() }
 	private val foundDevices = linkedMapOf<String, BluetoothDevice>()
 
 	private var bluetoothAdapter: BluetoothAdapter? = null
@@ -223,9 +329,10 @@ class MainActivity : Activity()
 	private var pendingConfigRestartDialog = false
 	private var isDrawerOpen = false
 	private var isTimerCommandPending = false
+	private var pendingTimerCommand: String? = null
 	private var isSynchronizingDurationPickers = false
-	private var isDurationPickerScrolling = false
-	private var hasPendingDurationSelection = false
+	private val scrollingDurationPickers = mutableSetOf<NumberPicker>()
+	private var hasUnsavedDurationChanges = false
 	private var themeMode = ThemeMode.System
 	private var appLanguage = AppLanguage.Italian
 	private var isDarkTheme = false
@@ -241,8 +348,6 @@ class MainActivity : Activity()
 	private var cachedRemainingSeconds = 0L
 	private var cachedMode = "--"
 	private var cachedErrors = "--"
-	private var cachedLocked = false
-	private var cachedLogged = false
 
 	private lateinit var rootFrame: FrameLayout
 	private lateinit var rootLayout: LinearLayout
@@ -259,12 +364,14 @@ class MainActivity : Activity()
 	private var scanButton: Button? = null
 	private var disconnectButton: Button? = null
 	private var rawStatusLabel: TextView? = null
-	private var modeLabel: TextView? = null
+	private var timerLabel: TextView? = null
 	private var errorsLabel: TextView? = null
+	private var durationPickerRow: LinearLayout? = null
 	private var hoursPicker: NumberPicker? = null
 	private var minutesPicker: NumberPicker? = null
 	private var secondsPicker: NumberPicker? = null
 	private var durationPickerHintLabel: TextView? = null
+	private var saveDurationButton: Button? = null
 	private var startPauseButton: Button? = null
 	private var stopTimerButton: Button? = null
 
@@ -853,7 +960,6 @@ class MainActivity : Activity()
 
 	private fun renderCurrentScreen()
 	{
-		handler.removeCallbacks(commitDurationSelection)
 		contentLayout.removeAllViews()
 		commandButtons.clear()
 		deviceListLayout = null
@@ -861,17 +967,19 @@ class MainActivity : Activity()
 		scanButton = null
 		disconnectButton = null
 		rawStatusLabel = null
-		modeLabel = null
+		timerLabel = null
 		errorsLabel = null
+		durationPickerRow = null
 		hoursPicker = null
 		minutesPicker = null
 		secondsPicker = null
 		durationPickerHintLabel = null
+		saveDurationButton = null
 		startPauseButton = null
 		stopTimerButton = null
 		isSynchronizingDurationPickers = false
-		isDurationPickerScrolling = false
-		hasPendingDurationSelection = false
+		scrollingDurationPickers.clear()
+		hasUnsavedDurationChanges = false
 		configAdminPinInput = null
 		configBleNameInput = null
 		configSoundCheck = null
@@ -899,33 +1007,35 @@ class MainActivity : Activity()
 		addPageHeader(tr("Comandi", "Controls"), tr("Controlla il countdown e ricevi lo stato in tempo reale.", "Control the countdown and receive real-time status updates."))
 
 		val timerCard = addCard()
-		modeLabel = TextView(this)
-		modeLabel!!.text = tr("Stato: --", "Status: --")
-		modeLabel!!.textSize = 14f
-		modeLabel!!.setTextColor(palette.textSecondary)
-		modeLabel!!.gravity = Gravity.CENTER_HORIZONTAL
-		timerCard.addView(modeLabel, matchWrap())
+		timerLabel = TextView(this)
+		timerLabel!!.text = "--:--"
+		timerLabel!!.textSize = 54f
+		timerLabel!!.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+		timerLabel!!.setTextColor(palette.textPrimary)
+		timerLabel!!.gravity = Gravity.CENTER
+		timerLabel!!.setPadding(0, dp(8), 0, dp(8))
+		timerCard.addView(timerLabel, matchWrap())
 
-		val durationPickerRow = LinearLayout(this)
-		durationPickerRow.orientation = LinearLayout.HORIZONTAL
-		durationPickerRow.gravity = Gravity.CENTER
-		durationPickerRow.setPadding(0, dp(4), 0, 0)
+		durationPickerRow = LinearLayout(this)
+		durationPickerRow!!.orientation = LinearLayout.HORIZONTAL
+		durationPickerRow!!.gravity = Gravity.CENTER
+		durationPickerRow!!.setPadding(0, dp(4), 0, 0)
 
 		hoursPicker = createDurationPicker(MaxTimerHours, tr("Ore", "Hours"))
 		minutesPicker = createDurationPicker(MaxTimerMinutesOrSeconds, tr("Minuti", "Minutes"))
 		secondsPicker = createDurationPicker(MaxTimerMinutesOrSeconds, tr("Secondi", "Seconds"))
 
-		durationPickerRow.addView(
+		durationPickerRow!!.addView(
 			createDurationPickerColumn(hoursPicker!!, tr("ore", "hours")),
 			durationPickerColumnParams()
 		)
-		durationPickerRow.addView(createDurationPickerSeparator(), durationPickerSeparatorParams())
-		durationPickerRow.addView(
+		durationPickerRow!!.addView(createDurationPickerSeparator(), durationPickerSeparatorParams())
+		durationPickerRow!!.addView(
 			createDurationPickerColumn(minutesPicker!!, tr("min", "min")),
 			durationPickerColumnParams()
 		)
-		durationPickerRow.addView(createDurationPickerSeparator(), durationPickerSeparatorParams())
-		durationPickerRow.addView(
+		durationPickerRow!!.addView(createDurationPickerSeparator(), durationPickerSeparatorParams())
+		durationPickerRow!!.addView(
 			createDurationPickerColumn(secondsPicker!!, tr("sec", "sec")),
 			durationPickerColumnParams()
 		)
@@ -937,6 +1047,11 @@ class MainActivity : Activity()
 		durationPickerHintLabel!!.setTextColor(palette.textSecondary)
 		durationPickerHintLabel!!.setPadding(0, dp(2), 0, dp(4))
 		timerCard.addView(durationPickerHintLabel, matchWrap())
+
+		saveDurationButton = createActionButton(tr("Salva", "Save"), ButtonStyle.Primary, true) {
+			saveSelectedDuration()
+		}
+		timerCard.addView(saveDurationButton, matchWrapWithTopMargin(4))
 
 		errorsLabel = TextView(this)
 		errorsLabel!!.text = tr("Errori: --", "Errors: --")
@@ -1627,45 +1742,77 @@ class MainActivity : Activity()
 
 	private fun createDurationPicker(maxValue: Int, description: String): NumberPicker
 	{
-		val picker = NumberPicker(this)
+		val picker = LargeNumberPicker(this)
 		picker.minValue = 0
 		picker.maxValue = maxValue
 		picker.value = 0
 		picker.wrapSelectorWheel = false
-		picker.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+		picker.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
 		picker.contentDescription = description
 		picker.setFormatter { value -> formatTimerPart(value) }
-		for (index in 0 until picker.childCount)
+		val input = pickerInput(picker)
+		if (input != null)
 		{
-			(picker.getChildAt(index) as? EditText)?.apply {
-				textSize = 36f
-				typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-				setTextColor(palette.textPrimary)
+			input.inputType = InputType.TYPE_CLASS_NUMBER
+			input.setSelectAllOnFocus(true)
+			input.textSize = 36f
+			input.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+			input.setTextColor(palette.textPrimary)
+			input.setOnClickListener {
+				input.requestFocus()
+				input.post {
+					input.selectAll()
+					val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+					inputMethodManager.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+				}
 			}
+			input.addTextChangedListener(object : TextWatcher {
+				override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+				override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+				override fun afterTextChanged(s: Editable?) {
+					if (input.hasFocus() && !isSynchronizingDurationPickers)
+					{
+						hasUnsavedDurationChanges = true
+						updateTimerControls()
+					}
+				}
+			})
 		}
 		picker.setOnValueChangedListener { _, _, _ ->
 			if (!isSynchronizingDurationPickers)
 			{
-				hasPendingDurationSelection = true
-				scheduleDurationCommit()
+				hasUnsavedDurationChanges = hasCachedStatus && selectedDurationSeconds() != cachedRemainingSeconds
+				updateTimerControls()
 			}
 		}
 		picker.setOnScrollListener { _, scrollState ->
-			when (scrollState)
+			if (scrollState == NumberPicker.OnScrollListener.SCROLL_STATE_IDLE)
 			{
-				NumberPicker.OnScrollListener.SCROLL_STATE_IDLE ->
-				{
-					isDurationPickerScrolling = false
-					commitSelectedDuration()
-				}
-				else ->
-				{
-					isDurationPickerScrolling = true
-					handler.removeCallbacks(commitDurationSelection)
-				}
+				scrollingDurationPickers.remove(picker)
 			}
+			else
+			{
+				scrollingDurationPickers.add(picker)
+			}
+			updateTimerControls()
 		}
 		return picker
+	}
+
+	private fun pickerInput(picker: NumberPicker?): EditText?
+	{
+		val numberPicker = picker ?: return null
+
+		for (index in 0 until numberPicker.childCount)
+		{
+			val child = numberPicker.getChildAt(index)
+			if (child is EditText)
+			{
+				return child
+			}
+		}
+
+		return null
 	}
 
 	private fun createDurationPickerColumn(picker: NumberPicker, unit: String): LinearLayout
@@ -2810,6 +2957,7 @@ class MainActivity : Activity()
 					loadUsersAfterConfig = false
 					isPostLoginSyncInProgress = false
 					isTimerCommandPending = false
+					pendingTimerCommand = null
 
 					if (pendingLoginPin != null && response == "ERR:LOGIN")
 					{
@@ -3324,14 +3472,13 @@ class MainActivity : Activity()
 
 	private fun clearCachedStatus()
 	{
-		handler.removeCallbacks(commitDurationSelection)
 		isTimerCommandPending = false
+		pendingTimerCommand = null
+		hasUnsavedDurationChanges = false
 		hasCachedStatus = false
 		cachedRemainingSeconds = 0L
 		cachedMode = "--"
 		cachedErrors = "--"
-		cachedLocked = false
-		cachedLogged = false
 	}
 
 	private fun parseStatus(response: String)
@@ -3353,36 +3500,46 @@ class MainActivity : Activity()
 
 		val remaining = values["remaining"]?.toUIntOrNull()?.toLong() ?: 0L
 		val errors = values["errors"] ?: "--"
-		val locked = values["locked"] == "1"
-		val logged = values["logged"] == "1"
+
+		val previousMode = cachedMode
+		val completedTimerCommand = pendingTimerCommand
+		val shouldAcceptDurationFromStatus = !hasUnsavedDurationChanges ||
+			!mode.equals("SET_TIMER", ignoreCase = true) ||
+			completedTimerCommand?.startsWith("SETTIME:") == true ||
+			completedTimerCommand == "RESET" ||
+			(!previousMode.equals("SET_TIMER", ignoreCase = true) && mode.equals("SET_TIMER", ignoreCase = true))
+
+		if (shouldAcceptDurationFromStatus)
+		{
+			hasUnsavedDurationChanges = false
+		}
 
 		hasCachedStatus = true
 		cachedRemainingSeconds = remaining
 		cachedMode = mode
 		cachedErrors = errors
-		cachedLocked = locked
-		cachedLogged = logged
 		isTimerCommandPending = false
+		pendingTimerCommand = null
 
-		applyCachedStatusToMainScreen()
+		applyCachedStatusToMainScreen(shouldAcceptDurationFromStatus)
 		updateVisibleButtons()
 	}
 
-	private fun applyCachedStatusToMainScreen()
+	private fun applyCachedStatusToMainScreen(forceDurationPickerSync: Boolean = false)
 	{
 		if (!hasCachedStatus)
 		{
 			return
 		}
 
-		updateDurationPickers(cachedRemainingSeconds)
-		modeLabel?.text = tr(
-			"Stato: $cachedMode  |  Login: ${if (cachedLogged) "OK" else "NO"}",
-			"Status: $cachedMode  |  Login: ${if (cachedLogged) "OK" else "NO"}"
-		)
+		timerLabel?.text = formatSeconds(cachedRemainingSeconds)
+		if (!hasUnsavedDurationChanges || forceDurationPickerSync)
+		{
+			updateDurationPickers(cachedRemainingSeconds)
+		}
 		errorsLabel?.text = tr(
-			"Errori: $cachedErrors  |  Blocco: ${if (cachedLocked) "SI" else "NO"}",
-			"Errors: $cachedErrors  |  Locked: ${if (cachedLocked) "YES" else "NO"}"
+			"Errori: $cachedErrors",
+			"Errors: $cachedErrors"
 		)
 		updateTimerControls()
 	}
@@ -3395,7 +3552,6 @@ class MainActivity : Activity()
 		val minutes = ((clampedSeconds % 3600L) / 60L).toInt()
 		val seconds = (clampedSeconds % 60L).toInt()
 
-		hasPendingDurationSelection = false
 		isSynchronizingDurationPickers = true
 		try
 		{
@@ -3409,27 +3565,17 @@ class MainActivity : Activity()
 		}
 	}
 
-	private fun scheduleDurationCommit()
+	private fun saveSelectedDuration()
 	{
-		if (!isDurationPickerEditable() || isDurationPickerScrolling)
+		if (!isDurationPickerEditable() || scrollingDurationPickers.isNotEmpty())
 		{
 			return
 		}
 
-		handler.removeCallbacks(commitDurationSelection)
-		handler.postDelayed(commitDurationSelection, 350)
-	}
-
-	private fun commitSelectedDuration()
-	{
-		handler.removeCallbacks(commitDurationSelection)
-
-		if (!hasPendingDurationSelection || !isDurationPickerEditable() || isDurationPickerScrolling)
+		if (!commitDurationPickerInputs())
 		{
 			return
 		}
-
-		hasPendingDurationSelection = false
 
 		if (selectedDurationSeconds() == 0L)
 		{
@@ -3440,11 +3586,59 @@ class MainActivity : Activity()
 		sendTimerCommand("SETTIME:${selectedDurationAsHhmmss()}")
 	}
 
+	private fun commitDurationPickerInputs(): Boolean
+	{
+		for (picker in listOf(hoursPicker, minutesPicker, secondsPicker))
+		{
+			val numberPicker = picker ?: continue
+			val input = pickerInput(numberPicker) ?: continue
+
+			val typedValue = input.text.toString().trim().toIntOrNull()
+			if (typedValue == null || typedValue !in numberPicker.minValue..numberPicker.maxValue)
+			{
+				showStatus(
+					tr(
+						"Inserisci un valore tra ${numberPicker.minValue} e ${numberPicker.maxValue}.",
+						"Enter a value between ${numberPicker.minValue} and ${numberPicker.maxValue}."
+					)
+				)
+				input.requestFocus()
+				input.post {
+					input.selectAll()
+					val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+					inputMethodManager.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+				}
+				return false
+			}
+
+			numberPicker.value = typedValue
+			if (input.hasFocus()) input.clearFocus()
+		}
+
+		hasUnsavedDurationChanges = hasCachedStatus && selectedDurationSeconds() != cachedRemainingSeconds
+		return true
+	}
+
 	private fun selectedDurationSeconds(): Long
 	{
 		return (hoursPicker?.value ?: 0) * 3600L +
 			(minutesPicker?.value ?: 0) * 60L +
 			(secondsPicker?.value ?: 0)
+	}
+
+	private fun hasPositiveDurationInput(): Boolean
+	{
+		for (picker in listOf(hoursPicker, minutesPicker, secondsPicker))
+		{
+			val numberPicker = picker ?: continue
+			val typedValue = pickerInput(numberPicker)?.text?.toString()?.trim()?.toIntOrNull()
+			if ((typedValue ?: numberPicker.value) > 0)
+			{
+				return true
+			}
+		}
+
+		return false
 	}
 
 	private fun selectedDurationAsHhmmss(): String
@@ -3464,6 +3658,7 @@ class MainActivity : Activity()
 		if (sendCommand(command))
 		{
 			isTimerCommandPending = true
+			pendingTimerCommand = command
 			updateVisibleButtons()
 		}
 	}
@@ -3492,9 +3687,17 @@ class MainActivity : Activity()
 	private fun updateTimerControls()
 	{
 		val timerControlReady = isTimerControlReady()
+		val isSettingDuration = hasCachedStatus && cachedMode.equals("SET_TIMER", ignoreCase = true) &&
+			pendingTimerCommand != "START"
+		timerLabel?.visibility = if (isSettingDuration) View.GONE else View.VISIBLE
+		durationPickerRow?.visibility = if (isSettingDuration) View.VISIBLE else View.GONE
+		durationPickerHintLabel?.visibility = if (isSettingDuration) View.VISIBLE else View.GONE
+		saveDurationButton?.visibility = if (isSettingDuration) View.VISIBLE else View.GONE
+
 		startPauseButton?.text = if (isTimerRunning()) tr("Pausa", "Pause") else tr("Start", "Start")
-		startPauseButton?.isEnabled = timerControlReady
-		startPauseButton?.alpha = if (timerControlReady) 1f else 0.45f
+		val canStartOrPause = timerControlReady && !hasUnsavedDurationChanges
+		startPauseButton?.isEnabled = canStartOrPause
+		startPauseButton?.alpha = if (canStartOrPause) 1f else 0.45f
 		stopTimerButton?.isEnabled = timerControlReady
 		stopTimerButton?.alpha = if (timerControlReady) 1f else 0.45f
 
@@ -3504,16 +3707,18 @@ class MainActivity : Activity()
 			picker?.isEnabled = editable
 			picker?.alpha = if (editable) 1f else 0.45f
 		}
+		val canSaveDuration = editable && hasUnsavedDurationChanges &&
+			scrollingDurationPickers.isEmpty() && hasPositiveDurationInput()
+		saveDurationButton?.isEnabled = canSaveDuration
+		saveDurationButton?.alpha = if (canSaveDuration) 1f else 0.45f
 
 		durationPickerHintLabel?.text = when
 		{
 			isTimerCommandPending -> tr("Aggiornamento del timer in corso...", "Updating timer...")
 			!hasCachedStatus -> tr("In attesa dello stato del timer.", "Waiting for the timer status.")
 			!areAuthenticatedCommandsReady() -> tr("Collega e autentica il dispositivo per modificare la durata.", "Connect and authenticate the device to change the duration.")
-			cachedMode.equals("SET_TIMER", ignoreCase = true) -> tr("Scorri ore, minuti o secondi per impostare la durata.", "Scroll hours, minutes, or seconds to set the duration.")
-			cachedMode.equals("STOPPED", ignoreCase = true) -> tr("Timer in pausa. Premi Stop per ripristinare la durata.", "Timer paused. Press Stop to restore the duration.")
-			cachedMode.equals("RUNNING", ignoreCase = true) -> tr("Timer in esecuzione.", "Timer is running.")
-			else -> tr("Premi Stop per ripristinare e modificare la durata.", "Press Stop to restore and change the duration.")
+			hasUnsavedDurationChanges -> tr("Modifiche non salvate. Premi Salva per applicarle.", "Unsaved changes. Press Save to apply them.")
+			else -> tr("Scorri ore, minuti o secondi e premi Salva.", "Scroll hours, minutes, or seconds, then press Save.")
 		}
 	}
 
@@ -3543,6 +3748,22 @@ class MainActivity : Activity()
 		}
 
 		return hours * 3600 + minutes * 60 + seconds
+	}
+
+	private fun formatSeconds(seconds: Long): String
+	{
+		val hours = seconds / 3600
+		val minutes = (seconds % 3600) / 60
+		val remainingSeconds = seconds % 60
+
+		return if (hours > 0)
+		{
+			"%02d:%02d:%02d".format(hours, minutes, remainingSeconds)
+		}
+		else
+		{
+			"%02d:%02d".format(minutes, remainingSeconds)
+		}
 	}
 
 	@SuppressLint("MissingPermission")
