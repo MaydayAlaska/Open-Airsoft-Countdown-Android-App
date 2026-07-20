@@ -856,7 +856,7 @@ class MainActivity : Activity()
 		drawerLayout.addView(spacer, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
 		val version = TextView(this)
-		version.text = tr("Versione 1.29", "Version 1.29")
+		version.text = tr("Versione v1.30", "Version v1.30")
 		version.textSize = 12f
 		version.gravity = Gravity.CENTER_HORIZONTAL
 		version.setTextColor(palette.textSecondary)
@@ -1416,7 +1416,7 @@ class MainActivity : Activity()
 		val infoCard = addCard()
 		addCardTitle(infoCard, tr("Informazioni", "Information"))
 		addCenteredInfoLogo(infoCard)
-		addInfoRow(infoCard, tr("Versione", "Version"), "1.29")
+		addInfoRow(infoCard, tr("Versione", "Version"), "v1.30")
 		addInfoRow(infoCard, tr("Tema attivo", "Active theme"), if (isDarkTheme) tr("Scuro", "Dark") else tr("Chiaro", "Light"))
 
 		addCardDescription(infoCard, tr("Puoi trovare gli aggiornamenti qui:", "You can find updates here:"))

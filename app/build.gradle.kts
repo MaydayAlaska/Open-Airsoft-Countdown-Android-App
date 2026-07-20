@@ -11,8 +11,8 @@ android {
 		applicationId = "com.maydayalaska.openairsoftcountdown"
 		minSdk = 23
 		targetSdk = 35
-		versionCode = 38
-		versionName = "1.28"
+		versionCode = 39
+		versionName = "1.30"
 	}
 
 	compileOptions {
